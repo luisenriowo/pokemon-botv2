@@ -154,14 +154,18 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
     return buffers, obs_dict, episodes_done, episode_rewards
 
 
-def train(config: Config, resume_path: str = None):
+def train(config: Config, resume_path: str = None, run_name: str = "A"):
     """Main self-play training loop."""
     # Update obs_size from environment
     config.obs_size = OBS_SIZE
 
+    # Separate dirs per run so parallel training doesn't collide
+    model_dir = os.path.join(config.model_save_dir, run_name)
+    log_dir = os.path.join(config.log_dir, run_name)
+
     ppo = PPOAgent(config)
     device = ppo.device
-    writer = setup_logging(config.log_dir)
+    writer = setup_logging(log_dir)
 
     start_timestep = 0
     if resume_path and os.path.exists(resume_path):
@@ -171,13 +175,14 @@ def train(config: Config, resume_path: str = None):
     # Opponent pool for pool-based self-play
     opponent_pool = []
 
-    env = make_env(config)
+    # Unique player names per run to avoid Showdown name collisions
+    env = make_env(config, p1_name=f"P1{run_name}", p2_name=f"P2{run_name}")
 
     timestep = start_timestep
     iteration = 0
     best_winrate = 0.0
 
-    print(f"Training PPO agent for gen9randombattle")
+    print(f"Training PPO agent for gen9randombattle (run={run_name})")
     print(f"  Device: {device}")
     print(f"  Obs size: {config.obs_size}")
     print(f"  Action space: {config.action_space_size}")
@@ -266,15 +271,15 @@ def train(config: Config, resume_path: str = None):
 
         # Save checkpoint
         if timestep % config.save_freq < n_transitions:
-            path = os.path.join(config.model_save_dir, f"ppo_{timestep}.pt")
+            path = os.path.join(model_dir, f"ppo_{timestep}.pt")
             save_checkpoint(ppo.model, ppo.optimizer, timestep, path)
 
-            latest_path = os.path.join(config.model_save_dir, "latest.pt")
+            latest_path = os.path.join(model_dir, "latest.pt")
             save_checkpoint(ppo.model, ppo.optimizer, timestep, latest_path)
 
         # Periodic evaluation vs SimpleHeuristicsPlayer
         if timestep % config.eval_freq < n_transitions:
-            eval_path = os.path.join(config.model_save_dir, "latest.pt")
+            eval_path = os.path.join(model_dir, "latest.pt")
             if os.path.exists(eval_path):
                 try:
                     winrate = evaluate_vs_heuristic(
@@ -284,7 +289,7 @@ def train(config: Config, resume_path: str = None):
                     print(f"  [Eval] vs Heuristic: {winrate:.1%} ({config.eval_battles} battles)")
                     if winrate > best_winrate:
                         best_winrate = winrate
-                        best_path = os.path.join(config.model_save_dir, "best.pt")
+                        best_path = os.path.join(model_dir, "best.pt")
                         save_checkpoint(ppo.model, ppo.optimizer, timestep, best_path)
                         print(f"  [Eval] New best model saved ({winrate:.1%})")
                 except Exception as e:
@@ -299,7 +304,7 @@ def train(config: Config, resume_path: str = None):
             print(f"  Opponent pool updated (size={len(opponent_pool)})")
 
     # Final save
-    final_path = os.path.join(config.model_save_dir, "final.pt")
+    final_path = os.path.join(model_dir, "final.pt")
     save_checkpoint(ppo.model, ppo.optimizer, timestep, final_path)
     print(f"\nTraining complete. Final model saved to {final_path}")
 
@@ -312,6 +317,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--timesteps", type=int, default=None, help="Total training timesteps")
     parser.add_argument("--port", type=int, default=8000, help="Showdown server port")
+    parser.add_argument("--name", type=str, default="A", help="Run name (unique per parallel run)")
     args = parser.parse_args()
 
     config = Config()
@@ -320,7 +326,7 @@ def main():
     if args.port:
         config.server_port = args.port
 
-    train(config, resume_path=args.resume)
+    train(config, resume_path=args.resume, run_name=args.name)
 
 
 if __name__ == "__main__":

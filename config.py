@@ -48,7 +48,7 @@ class Config:
     # Self-play
     opponent_update_freq: int = 200_000
     opponent_pool_size: int = 5
-    use_opponent_pool: bool = False
+    use_opponent_pool: bool = True
 
     # MCTS (Phase 3)
     mcts_rollouts: int = 500
