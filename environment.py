@@ -79,7 +79,27 @@ DIM_MOVE = 1 + 1 + N_TYPES + 3 + 1 + 1 + 1 + 1 + 1 + 1 + 7 + 1 + 1  # 38
 DIM_OWN_BENCH = 1 + 1 + N_STATUS + N_TYPES + 1 + 6  # 33
 DIM_OPP_BENCH = 1 + 1 + 1 + N_TYPES + N_STATUS      # 27
 
-OBS_SIZE = (
+# ── Categorical identity features ─────────────────────────────────────────────
+# Layout in obs[N_CONTINUOUS:]:
+#   [0]      own_active species
+#   [1:5]    own_active moves (4)
+#   [5]      own_active ability
+#   [6]      own_active item
+#   [7:12]   own_bench species (5)
+#   [12:17]  own_bench abilities (5)
+#   [17:22]  own_bench items (5)
+#   [22]     opp_active species
+#   [23]     opp_active ability
+#   [24]     opp_active item
+#   [25:30]  opp_bench species (5)
+N_CATEGORICAL = 30
+
+SPECIES_VOCAB = 1500
+MOVE_VOCAB = 1000
+ABILITY_VOCAB = 400
+ITEM_VOCAB = 300
+
+N_CONTINUOUS = (
     DIM_WEATHER
     + DIM_TERRAIN
     + DIM_SIDE * 2
@@ -93,8 +113,19 @@ OBS_SIZE = (
     + DIM_OPP_BENCH * 5   # opp bench
 )  # = 652
 
+OBS_SIZE = N_CONTINUOUS + N_CATEGORICAL  # = 682
+
 
 # ── Encoding helpers ──────────────────────────────────────────────────────────
+
+def _name_to_id(name: str, vocab_size: int) -> int:
+    """Deterministic hash (djb2) of a name to an index in [1, vocab_size). 0 = unknown/empty."""
+    if not name:
+        return 0
+    h = 5381
+    for c in name:
+        h = ((h << 5) + h + ord(c)) & 0xFFFFFFFF
+    return (h % (vocab_size - 1)) + 1
 
 def _type_onehot(ptype: Optional[PokemonType]) -> np.ndarray:
     vec = np.zeros(N_TYPES, dtype=np.float32)
@@ -355,6 +386,110 @@ def _encode_opp_bench_pokemon(pokemon: Optional[Pokemon]) -> np.ndarray:
 
 # ── Environment ───────────────────────────────────────────────────────────────
 
+def embed_battle_standalone(battle: AbstractBattle) -> np.ndarray:
+    """Encode full battle state into a flat vector (shared by Gen9Env and TrainedRLPlayer)."""
+    parts = []
+
+    # 1. Weather (8)
+    parts.append(_encode_weather(battle))
+
+    # 2. Terrain (5)
+    parts.append(_encode_terrain(battle))
+
+    # 3. Side conditions: own (10) + opponent (10)
+    parts.append(_encode_side_conditions(battle.side_conditions))
+    parts.append(_encode_side_conditions(battle.opponent_side_conditions))
+
+    # 4. Trick room (1)
+    parts.append(np.array(
+        [float(Field.TRICK_ROOM in battle.fields)],
+        dtype=np.float32,
+    ))
+
+    # 5. Gimmicks (6)
+    parts.append(np.array([
+        float(battle.can_tera),
+        float(battle.can_mega_evolve),
+        float(battle.can_z_move),
+        float(battle.can_dynamax),
+        float(getattr(battle, 'used_tera', False) or False),
+        float(getattr(battle, 'opponent_used_tera', False) or False),
+    ], dtype=np.float32))
+
+    # 6. Meta info (4)
+    own_fainted = sum(1 for p in battle.team.values() if p.fainted)
+    opp_fainted = sum(1 for p in battle.opponent_team.values() if p.fainted)
+    parts.append(np.array([
+        float(battle.turn) / 100.0,
+        float(own_fainted) / 6.0,
+        float(opp_fainted) / 6.0,
+        float(battle.force_switch),
+    ], dtype=np.float32))
+
+    # 7. Own active pokemon (78)
+    parts.append(_encode_active_pokemon(battle.active_pokemon))
+
+    # 8. Own moves (38 × 4 = 152)
+    own_moves = list(battle.active_pokemon.moves.values()) if battle.active_pokemon else []
+    opp_active = battle.opponent_active_pokemon
+    for i in range(4):
+        move = own_moves[i] if i < len(own_moves) else None
+        parts.append(_encode_move(move, opp_active))
+
+    # 9. Opponent active pokemon (78)
+    parts.append(_encode_active_pokemon(opp_active))
+
+    # 10. Own bench (33 × 5 = 165)
+    own_bench = [
+        p for p in battle.team.values()
+        if p != battle.active_pokemon
+    ]
+    for i in range(5):
+        mon = own_bench[i] if i < len(own_bench) else None
+        parts.append(_encode_own_bench_pokemon(mon))
+
+    # 11. Opponent bench (27 × 5 = 135)
+    opp_bench = [
+        p for p in battle.opponent_team.values()
+        if p != opp_active
+    ]
+    for i in range(5):
+        mon = opp_bench[i] if i < len(opp_bench) else None
+        parts.append(_encode_opp_bench_pokemon(mon))
+
+    # 12. Categorical identity indices (N_CATEGORICAL = 30)
+    cat = np.zeros(N_CATEGORICAL, dtype=np.float32)
+    active = battle.active_pokemon
+    if active:
+        cat[0] = _name_to_id(active.species, SPECIES_VOCAB)
+        active_moves = list(active.moves.values())
+        for i in range(min(4, len(active_moves))):
+            cat[1 + i] = _name_to_id(active_moves[i].id, MOVE_VOCAB)
+        if active.ability:
+            cat[5] = _name_to_id(active.ability, ABILITY_VOCAB)
+        if active.item:
+            cat[6] = _name_to_id(active.item, ITEM_VOCAB)
+    for i, mon in enumerate(own_bench[:5]):
+        cat[7 + i] = _name_to_id(mon.species, SPECIES_VOCAB)
+        if mon.ability:
+            cat[12 + i] = _name_to_id(mon.ability, ABILITY_VOCAB)
+        if mon.item:
+            cat[17 + i] = _name_to_id(mon.item, ITEM_VOCAB)
+    if opp_active:
+        cat[22] = _name_to_id(opp_active.species, SPECIES_VOCAB)
+        if opp_active.ability:
+            cat[23] = _name_to_id(opp_active.ability, ABILITY_VOCAB)
+        if opp_active.item:
+            cat[24] = _name_to_id(opp_active.item, ITEM_VOCAB)
+    for i, mon in enumerate(opp_bench[:5]):
+        cat[25 + i] = _name_to_id(mon.species, SPECIES_VOCAB)
+    parts.append(cat)
+
+    obs = np.concatenate(parts)
+    assert obs.shape == (OBS_SIZE,), f"Expected {OBS_SIZE}, got {obs.shape[0]}"
+    return obs
+
+
 class Gen9Env(SinglesEnv):
     def __init__(self, config: Config, **kwargs):
         super().__init__(
@@ -371,78 +506,7 @@ class Gen9Env(SinglesEnv):
         return Box(low=-2.0, high=2.0, shape=(OBS_SIZE,), dtype=np.float32)
 
     def embed_battle(self, battle: AbstractBattle) -> np.ndarray:
-        """Encode full battle state into a flat 652-dim vector."""
-        parts = []
-
-        # 1. Weather (8)
-        parts.append(_encode_weather(battle))
-
-        # 2. Terrain (5)
-        parts.append(_encode_terrain(battle))
-
-        # 3. Side conditions: own (10) + opponent (10)
-        parts.append(_encode_side_conditions(battle.side_conditions))
-        parts.append(_encode_side_conditions(battle.opponent_side_conditions))
-
-        # 4. Trick room (1)
-        parts.append(np.array(
-            [float(Field.TRICK_ROOM in battle.fields)],
-            dtype=np.float32,
-        ))
-
-        # 5. Gimmicks (6)
-        parts.append(np.array([
-            float(battle.can_tera),
-            float(battle.can_mega_evolve),
-            float(battle.can_z_move),
-            float(battle.can_dynamax),
-            float(battle.used_tera or False),
-            float(battle.opponent_used_tera or False),
-        ], dtype=np.float32))
-
-        # 6. Meta info (4)
-        own_fainted = sum(1 for p in battle.team.values() if p.fainted)
-        opp_fainted = sum(1 for p in battle.opponent_team.values() if p.fainted)
-        parts.append(np.array([
-            float(battle.turn) / 100.0,
-            float(own_fainted) / 6.0,
-            float(opp_fainted) / 6.0,
-            float(battle.force_switch),
-        ], dtype=np.float32))
-
-        # 7. Own active pokemon (78)
-        parts.append(_encode_active_pokemon(battle.active_pokemon))
-
-        # 8. Own moves (38 × 4 = 152)
-        own_moves = list(battle.active_pokemon.moves.values()) if battle.active_pokemon else []
-        opp_active = battle.opponent_active_pokemon
-        for i in range(4):
-            move = own_moves[i] if i < len(own_moves) else None
-            parts.append(_encode_move(move, opp_active))
-
-        # 9. Opponent active pokemon (78)
-        parts.append(_encode_active_pokemon(opp_active))
-
-        # 10. Own bench (33 × 5 = 165)
-        own_bench = [
-            p for p in battle.team.values()
-            if p != battle.active_pokemon
-        ]
-        for i in range(5):
-            mon = own_bench[i] if i < len(own_bench) else None
-            parts.append(_encode_own_bench_pokemon(mon))
-
-        # 11. Opponent bench (27 × 5 = 135)
-        opp_bench = [
-            p for p in battle.opponent_team.values()
-            if p != opp_active
-        ]
-        for i in range(5):
-            mon = opp_bench[i] if i < len(opp_bench) else None
-            parts.append(_encode_opp_bench_pokemon(mon))
-
-        obs = np.concatenate(parts)
-        assert obs.shape == (OBS_SIZE,), f"Expected {OBS_SIZE}, got {obs.shape[0]}"
+        obs = embed_battle_standalone(battle)
 
         # Store mask and battle reference for training loop access
         agent_name = battle.player_username

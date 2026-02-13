@@ -1,2 +1,4 @@
 .venv
 pokemon-showdown/
+models/
+.claude/

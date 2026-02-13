@@ -2,18 +2,51 @@ import argparse
 import asyncio
 import copy
 import os
+import random
 import sys
 import time
 
 import numpy as np
 import torch
 
-from poke_env import AccountConfiguration, LocalhostServerConfiguration
+from poke_env import AccountConfiguration, LocalhostServerConfiguration, SimpleHeuristicsPlayer
 
 from agent import PPOAgent
+from battle_player import TrainedRLPlayer
 from config import Config
 from environment import Gen9Env, OBS_SIZE
+from model import ActorCritic
 from utils import compute_action_mask, save_checkpoint, load_checkpoint, setup_logging
+
+
+def evaluate_vs_heuristic(model_path: str, config: Config, n_battles: int = 50) -> float:
+    """Evaluate the current model against SimpleHeuristicsPlayer.
+
+    Runs in a fresh event loop (safe to call from sync training code).
+    Returns win rate as a float in [0, 1].
+    """
+    async def _eval():
+        rl_player = TrainedRLPlayer(
+            model_path=model_path,
+            config=config,
+            deterministic=True,
+            account_configuration=AccountConfiguration("EvalAgent", None),
+            battle_format=config.battle_format,
+            server_configuration=LocalhostServerConfiguration,
+        )
+        opponent = SimpleHeuristicsPlayer(
+            account_configuration=AccountConfiguration("HeuristicOpp", None),
+            battle_format=config.battle_format,
+            server_configuration=LocalhostServerConfiguration,
+        )
+        await rl_player.battle_against(opponent, n_battles=n_battles)
+        return rl_player.n_won_battles / max(n_battles, 1)
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_eval())
+    finally:
+        loop.close()
 
 
 def make_env(config: Config, p1_name: str = "PPOPlayer1", p2_name: str = "PPOPlayer2"):
@@ -28,15 +61,24 @@ def make_env(config: Config, p1_name: str = "PPOPlayer1", p2_name: str = "PPOPla
     return env
 
 
-def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict):
+def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
+                     opponent_model: ActorCritic = None):
     """Collect rollout_steps env steps, returning per-agent buffers and latest obs.
 
     Each env step produces transitions for all active agents.
     We store them in separate buffers (one per agent) for correct GAE.
-    """
-    buffers = {name: agent.create_buffer(config.rollout_steps) for name in env.possible_agents}
 
-    total_rewards = {name: 0.0 for name in env.possible_agents}
+    If opponent_model is provided, player 2 uses that frozen model for action
+    selection and only player 1's buffer is used for training.
+    """
+    agents_list = env.possible_agents
+    p1, p2 = agents_list[0], agents_list[1]
+
+    # When using opponent pool, only train on p1 data
+    train_agents = {p1} if opponent_model else set(agents_list)
+    buffers = {name: agent.create_buffer(config.rollout_steps) for name in train_agents}
+
+    total_rewards = {name: 0.0 for name in agents_list}
     episodes_done = 0
     episode_rewards = []
 
@@ -47,13 +89,21 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict):
         for ag in env.agents:
             obs = obs_dict[ag]
             mask = env.current_masks.get(ag, compute_action_mask(env.current_battles[ag]))
-            action, log_prob, value = agent.act(obs, mask)
+
+            if ag == p2 and opponent_model is not None:
+                # Opponent uses frozen pool model
+                action, log_prob, value = opponent_model.act(obs, mask)
+            else:
+                action, log_prob, value = agent.act(obs, mask)
+
             actions[ag] = np.int64(action)
             step_data[ag] = (obs, action, log_prob, value, mask)
 
         next_obs, rewards, terminated, truncated, infos = env.step(actions)
 
         for ag, (obs, action, log_prob, value, mask) in step_data.items():
+            if ag not in train_agents:
+                continue
             reward = rewards.get(ag, 0.0)
             done = terminated.get(ag, False) or truncated.get(ag, False)
             buffers[ag].add(obs, action, log_prob, value, reward, done, mask)
@@ -61,12 +111,12 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict):
 
         all_done = all(
             terminated.get(ag, False) or truncated.get(ag, False)
-            for ag in env.possible_agents
+            for ag in agents_list
         )
 
         if all_done:
             episodes_done += 1
-            for ag in env.possible_agents:
+            for ag in train_agents:
                 episode_rewards.append(total_rewards[ag])
                 total_rewards[ag] = 0.0
             obs_dict, _ = env.reset()
@@ -74,7 +124,7 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict):
             obs_dict = next_obs
 
     # Compute last values for bootstrapping
-    for ag in env.possible_agents:
+    for ag in train_agents:
         if ag in obs_dict and ag in env.agents:
             mask = env.current_masks.get(ag, np.ones(config.action_space_size, dtype=np.float32))
             _, _, last_value = agent.act(obs_dict[ag], mask)
@@ -90,7 +140,10 @@ def train(config: Config, resume_path: str = None):
     # Update obs_size from environment
     config.obs_size = OBS_SIZE
 
-    ppo = PPOAgent(config)
+    # Auto-detect GPU
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    ppo = PPOAgent(config, device=device)
     writer = setup_logging(config.log_dir)
 
     start_timestep = 0
@@ -109,6 +162,7 @@ def train(config: Config, resume_path: str = None):
     best_winrate = 0.0
 
     print(f"Training PPO agent for gen9randombattle")
+    print(f"  Device: {device}")
     print(f"  Obs size: {config.obs_size}")
     print(f"  Action space: {config.action_space_size}")
     print(f"  Total timesteps: {config.total_timesteps}")
@@ -116,13 +170,39 @@ def train(config: Config, resume_path: str = None):
     print(f"  Reward: sparse terminal (+1/-1/0)")
     print()
 
+    # Frozen opponent model for pool-based self-play
+    opponent_model = None
+    if config.use_opponent_pool:
+        opponent_model = ActorCritic(
+            obs_dim=config.obs_size,
+            action_dim=config.action_space_size,
+            hidden_sizes=config.hidden_sizes,
+            head_hidden=config.head_hidden,
+            species_vocab=config.species_vocab,
+            move_vocab=config.move_vocab,
+            ability_vocab=config.ability_vocab,
+            item_vocab=config.item_vocab,
+            species_embed_dim=config.species_embed_dim,
+            move_embed_dim=config.move_embed_dim,
+            ability_embed_dim=config.ability_embed_dim,
+            item_embed_dim=config.item_embed_dim,
+        ).to(device)
+        opponent_model.eval()
+
     while timestep < config.total_timesteps:
         t0 = time.time()
         progress = timestep / config.total_timesteps
 
+        # Select opponent from pool (or None → self-play with current model)
+        active_opponent = None
+        if config.use_opponent_pool and opponent_pool and opponent_model is not None:
+            snapshot = random.choice(opponent_pool)
+            opponent_model.load_state_dict(snapshot)
+            active_opponent = opponent_model
+
         # Collect rollout
         buffers, obs_dict, episodes_done, episode_rewards = collect_rollout(
-            env, ppo, config, obs_dict
+            env, ppo, config, obs_dict, opponent_model=active_opponent
         )
 
         # Count transitions collected
@@ -172,6 +252,24 @@ def train(config: Config, resume_path: str = None):
 
             latest_path = os.path.join(config.model_save_dir, "latest.pt")
             save_checkpoint(ppo.model, ppo.optimizer, timestep, latest_path)
+
+        # Periodic evaluation vs SimpleHeuristicsPlayer
+        if timestep % config.eval_freq < n_transitions:
+            eval_path = os.path.join(config.model_save_dir, "latest.pt")
+            if os.path.exists(eval_path):
+                try:
+                    winrate = evaluate_vs_heuristic(
+                        eval_path, config, n_battles=config.eval_battles
+                    )
+                    writer.add_scalar("eval/vs_heuristic_winrate", winrate, timestep)
+                    print(f"  [Eval] vs Heuristic: {winrate:.1%} ({config.eval_battles} battles)")
+                    if winrate > best_winrate:
+                        best_winrate = winrate
+                        best_path = os.path.join(config.model_save_dir, "best.pt")
+                        save_checkpoint(ppo.model, ppo.optimizer, timestep, best_path)
+                        print(f"  [Eval] New best model saved ({winrate:.1%})")
+                except Exception as e:
+                    print(f"  [Eval] Failed: {e}")
 
         # Update opponent pool
         if timestep % config.opponent_update_freq < n_transitions:

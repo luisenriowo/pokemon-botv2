@@ -79,6 +79,14 @@ class PPOAgent:
             action_dim=config.action_space_size,
             hidden_sizes=config.hidden_sizes,
             head_hidden=config.head_hidden,
+            species_vocab=config.species_vocab,
+            move_vocab=config.move_vocab,
+            ability_vocab=config.ability_vocab,
+            item_vocab=config.item_vocab,
+            species_embed_dim=config.species_embed_dim,
+            move_embed_dim=config.move_embed_dim,
+            ability_embed_dim=config.ability_embed_dim,
+            item_embed_dim=config.item_embed_dim,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr, eps=1e-5)
 
