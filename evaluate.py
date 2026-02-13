@@ -19,6 +19,8 @@ OPPONENTS = {
     "heuristic": SimpleHeuristicsPlayer,
 }
 
+_eval_counter = 0
+
 
 async def evaluate_against(
     model_path: str,
@@ -28,18 +30,22 @@ async def evaluate_against(
     deterministic: bool = True,
 ):
     """Evaluate trained model against a baseline opponent."""
+    global _eval_counter
+    _eval_counter += 1
+    tag = _eval_counter
+
     rl_player = TrainedRLPlayer(
         model_path=model_path,
         config=config,
         deterministic=deterministic,
-        account_configuration=AccountConfiguration("RLAgent", None),
+        account_configuration=AccountConfiguration(f"RLAgent{tag}", None),
         battle_format=config.battle_format,
         server_configuration=LocalhostServerConfiguration,
     )
 
     opp_cls = OPPONENTS[opponent_type]
     opponent = opp_cls(
-        account_configuration=AccountConfiguration("Opponent", None),
+        account_configuration=AccountConfiguration(f"Opp{tag}", None),
         battle_format=config.battle_format,
         server_configuration=LocalhostServerConfiguration,
     )

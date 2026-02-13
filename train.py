@@ -19,23 +19,30 @@ from model import ActorCritic
 from utils import compute_action_mask, save_checkpoint, load_checkpoint, setup_logging
 
 
+_eval_counter = 0
+
+
 def evaluate_vs_heuristic(model_path: str, config: Config, n_battles: int = 50) -> float:
     """Evaluate the current model against SimpleHeuristicsPlayer.
 
     Runs in a fresh event loop (safe to call from sync training code).
     Returns win rate as a float in [0, 1].
     """
+    global _eval_counter
+    _eval_counter += 1
+    tag = _eval_counter
+
     async def _eval():
         rl_player = TrainedRLPlayer(
             model_path=model_path,
             config=config,
             deterministic=True,
-            account_configuration=AccountConfiguration("EvalAgent", None),
+            account_configuration=AccountConfiguration(f"Eval{tag}", None),
             battle_format=config.battle_format,
             server_configuration=LocalhostServerConfiguration,
         )
         opponent = SimpleHeuristicsPlayer(
-            account_configuration=AccountConfiguration("HeuristicOpp", None),
+            account_configuration=AccountConfiguration(f"Heur{tag}", None),
             battle_format=config.battle_format,
             server_configuration=LocalhostServerConfiguration,
         )
@@ -83,6 +90,10 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
     episode_rewards = []
 
     for _ in range(config.rollout_steps):
+        if not env.agents:
+            obs_dict, _ = env.reset()
+            continue
+
         actions = {}
         step_data = {}
 
@@ -91,7 +102,6 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
             mask = env.current_masks.get(ag, compute_action_mask(env.current_battles[ag]))
 
             if ag == p2 and opponent_model is not None:
-                # Opponent uses frozen pool model
                 action, log_prob, value = opponent_model.act(obs, mask)
             else:
                 action, log_prob, value = agent.act(obs, mask)
@@ -99,7 +109,16 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
             actions[ag] = np.int64(action)
             step_data[ag] = (obs, action, log_prob, value, mask)
 
-        next_obs, rewards, terminated, truncated, infos = env.step(actions)
+        # poke-env can mark the battle finished between obs and step (race condition)
+        try:
+            next_obs, rewards, terminated, truncated, infos = env.step(actions)
+        except (AssertionError, Exception):
+            episodes_done += 1
+            for ag in train_agents:
+                episode_rewards.append(total_rewards[ag])
+                total_rewards[ag] = 0.0
+            obs_dict, _ = env.reset()
+            continue
 
         for ag, (obs, action, log_prob, value, mask) in step_data.items():
             if ag not in train_agents:
@@ -109,7 +128,7 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
             buffers[ag].add(obs, action, log_prob, value, reward, done, mask)
             total_rewards[ag] += reward
 
-        all_done = all(
+        all_done = not env.agents or all(
             terminated.get(ag, False) or truncated.get(ag, False)
             for ag in agents_list
         )
@@ -140,10 +159,8 @@ def train(config: Config, resume_path: str = None):
     # Update obs_size from environment
     config.obs_size = OBS_SIZE
 
-    # Auto-detect GPU
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    ppo = PPOAgent(config, device=device)
+    ppo = PPOAgent(config)
+    device = ppo.device
     writer = setup_logging(config.log_dir)
 
     start_timestep = 0
@@ -155,7 +172,6 @@ def train(config: Config, resume_path: str = None):
     opponent_pool = []
 
     env = make_env(config)
-    obs_dict, _ = env.reset()
 
     timestep = start_timestep
     iteration = 0
@@ -188,6 +204,9 @@ def train(config: Config, resume_path: str = None):
             item_embed_dim=config.item_embed_dim,
         ).to(device)
         opponent_model.eval()
+
+    # Start first battle right before entering the loop (minimize idle time)
+    obs_dict, _ = env.reset()
 
     while timestep < config.total_timesteps:
         t0 = time.time()

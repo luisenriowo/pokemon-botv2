@@ -71,8 +71,10 @@ class RolloutBuffer:
 
 
 class PPOAgent:
-    def __init__(self, config: Config, device: str = "cpu"):
+    def __init__(self, config: Config, device: str = None):
         self.config = config
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.model = ActorCritic(
             obs_dim=config.obs_size,
