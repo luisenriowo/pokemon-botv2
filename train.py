@@ -22,7 +22,8 @@ from utils import compute_action_mask, save_checkpoint, load_checkpoint, setup_l
 _eval_counter = 0
 
 
-def evaluate_vs_heuristic(model_path: str, config: Config, n_battles: int = 50) -> float:
+def evaluate_vs_heuristic(model_path: str, config: Config, n_battles: int = 50,
+                          run_name: str = "A") -> float:
     """Evaluate the current model against SimpleHeuristicsPlayer.
 
     Runs in a fresh event loop (safe to call from sync training code).
@@ -37,12 +38,12 @@ def evaluate_vs_heuristic(model_path: str, config: Config, n_battles: int = 50) 
             model_path=model_path,
             config=config,
             deterministic=True,
-            account_configuration=AccountConfiguration(f"Eval{tag}", None),
+            account_configuration=AccountConfiguration(f"Ev{run_name}{tag}", None),
             battle_format=config.battle_format,
             server_configuration=LocalhostServerConfiguration,
         )
         opponent = SimpleHeuristicsPlayer(
-            account_configuration=AccountConfiguration(f"Heur{tag}", None),
+            account_configuration=AccountConfiguration(f"He{run_name}{tag}", None),
             battle_format=config.battle_format,
             server_configuration=LocalhostServerConfiguration,
         )
@@ -283,7 +284,8 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
             if os.path.exists(eval_path):
                 try:
                     winrate = evaluate_vs_heuristic(
-                        eval_path, config, n_battles=config.eval_battles
+                        eval_path, config, n_battles=config.eval_battles,
+                        run_name=run_name,
                     )
                     writer.add_scalar("eval/vs_heuristic_winrate", winrate, timestep)
                     print(f"  [Eval] vs Heuristic: {winrate:.1%} ({config.eval_battles} battles)")

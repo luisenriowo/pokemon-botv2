@@ -37,7 +37,7 @@ class Config:
     n_minibatches: int = 4
 
     # Rollout
-    rollout_steps: int = 256
+    rollout_steps: int = 1024
 
     # Training
     total_timesteps: int = 10_000_000
@@ -48,7 +48,7 @@ class Config:
     # Self-play
     opponent_update_freq: int = 200_000
     opponent_pool_size: int = 5
-    use_opponent_pool: bool = True
+    use_opponent_pool: bool = False
 
     # MCTS (Phase 3)
     mcts_rollouts: int = 500
