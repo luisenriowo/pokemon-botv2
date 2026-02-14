@@ -99,16 +99,19 @@ class PPOAgent:
         """Select action using current policy."""
         return self.model.act(obs, mask)
 
-    def update(self, buffers: list[RolloutBuffer], progress: float = 0.0):
+    def update(self, buffers: list[RolloutBuffer], progress: float = 0.0,
+               entropy_coef: float = None):
         """PPO update from one or more rollout buffers.
 
         Args:
             buffers: list of RolloutBuffers (one per agent trajectory)
             progress: training progress in [0, 1] for annealing
+            entropy_coef: override entropy coefficient (for annealing)
         Returns:
             dict with loss stats
         """
         cfg = self.config
+        ent_coef = entropy_coef if entropy_coef is not None else cfg.entropy_coef
 
         # Learning rate annealing
         if cfg.anneal_lr:
@@ -166,7 +169,7 @@ class PPOAgent:
                 # Entropy bonus
                 ent_loss = entropy.mean()
 
-                loss = pg_loss + cfg.value_coef * v_loss - cfg.entropy_coef * ent_loss
+                loss = pg_loss + cfg.value_coef * v_loss - ent_coef * ent_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()

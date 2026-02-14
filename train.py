@@ -69,8 +69,51 @@ def make_env(config: Config, p1_name: str = "PPOPlayer1", p2_name: str = "PPOPla
     return env
 
 
+def _max_power_action(battle, mask):
+    """MaxBasePowerPlayer logic: pick the highest base power legal move."""
+    best_action = -1
+    best_power = -1
+    for i, move in enumerate(battle.available_moves[:4]):
+        if mask[i] > 0 and move.base_power > best_power:
+            best_power = move.base_power
+            best_action = i
+    if best_action >= 0:
+        return best_action
+    legal = np.where(mask > 0)[0]
+    return int(np.random.choice(legal)) if len(legal) > 0 else 0
+
+
+def _heuristic_action(battle, mask):
+    """Simplified heuristic: best damage move considering type effectiveness + STAB."""
+    best_action = -1
+    best_score = -1.0
+    active = battle.active_pokemon
+    opp = battle.opponent_active_pokemon
+
+    for i, move in enumerate(battle.available_moves[:4]):
+        if mask[i] == 0:
+            continue
+        score = float(move.base_power)
+        if score > 0 and opp:
+            try:
+                score *= opp.damage_multiplier(move)
+            except Exception:
+                pass
+            if active and move.type in active.types:
+                score *= 1.5
+        if score > best_score:
+            best_score = score
+            best_action = i
+
+    if best_action >= 0:
+        return best_action
+    legal = np.where(mask > 0)[0]
+    return int(np.random.choice(legal)) if len(legal) > 0 else 0
+
+
 def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
-                     opponent_model: ActorCritic = None):
+                     opponent_model: ActorCritic = None,
+                     curriculum_fn=None):
     """Collect rollout_steps env steps, returning per-agent buffers and latest obs.
 
     Each env step produces transitions for all active agents.
@@ -78,12 +121,14 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
 
     If opponent_model is provided, player 2 uses that frozen model for action
     selection and only player 1's buffer is used for training.
+    If curriculum_fn is provided, player 2 uses that function (takes battle, mask)
+    and only player 1's buffer is used for training.
     """
     agents_list = env.possible_agents
     p1, p2 = agents_list[0], agents_list[1]
 
-    # When using opponent pool, only train on p1 data
-    train_agents = {p1} if opponent_model else set(agents_list)
+    # When using curriculum or opponent pool, only train on p1 data
+    train_agents = {p1} if (opponent_model or curriculum_fn) else set(agents_list)
     buffers = {name: agent.create_buffer(config.rollout_steps) for name in train_agents}
 
     total_rewards = {name: 0.0 for name in agents_list}
@@ -102,7 +147,11 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
             obs = obs_dict[ag]
             mask = env.current_masks.get(ag, compute_action_mask(env.current_battles[ag]))
 
-            if ag == p2 and opponent_model is not None:
+            if ag == p2 and curriculum_fn is not None:
+                battle = env.current_battles[ag]
+                action = curriculum_fn(battle, mask)
+                log_prob, value = 0.0, 0.0
+            elif ag == p2 and opponent_model is not None:
                 action, log_prob, value = opponent_model.act(obs, mask)
             else:
                 action, log_prob, value = agent.act(obs, mask)
@@ -193,7 +242,10 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
     print(f"  Action space: {config.action_space_size}")
     print(f"  Total timesteps: {config.total_timesteps}")
     print(f"  Rollout steps: {config.rollout_steps}")
-    print(f"  Reward: sparse terminal (+1/-1/0)")
+    print(f"  Reward: dense delta (fainted={config.fainted_value}, hp={config.hp_value})")
+    print(f"  Curriculum: MaxPower<{config.curriculum_phase1_steps/1e6:.0f}M, "
+          f"Heuristic<{config.curriculum_phase2_steps/1e6:.0f}M, Self-play after")
+    print(f"  Entropy: {config.entropy_coef} -> {config.entropy_coef_end}")
     print()
 
     # Frozen opponent model for pool-based self-play
@@ -218,20 +270,41 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
     # Start first battle right before entering the loop (minimize idle time)
     obs_dict, _ = env.reset()
 
+    prev_phase = None
+
     while timestep < config.total_timesteps:
         t0 = time.time()
         progress = timestep / config.total_timesteps
 
-        # Select opponent from pool (or None → self-play with current model)
+        # Entropy annealing (linear decay)
+        entropy_coef = config.entropy_coef + (config.entropy_coef_end - config.entropy_coef) * progress
+
+        # Curriculum phase selection
+        curriculum_fn = None
         active_opponent = None
-        if config.use_opponent_pool and opponent_pool and opponent_model is not None:
-            snapshot = random.choice(opponent_pool)
-            opponent_model.load_state_dict(snapshot)
-            active_opponent = opponent_model
+        if timestep < config.curriculum_phase1_steps:
+            phase = "MaxPower"
+            curriculum_fn = _max_power_action
+        elif timestep < config.curriculum_phase2_steps:
+            phase = "Heuristic"
+            curriculum_fn = _heuristic_action
+        else:
+            phase = "Self-play"
+            # Select opponent from pool (or None → self-play with current model)
+            if config.use_opponent_pool and opponent_pool and opponent_model is not None:
+                snapshot = random.choice(opponent_pool)
+                opponent_model.load_state_dict(snapshot)
+                active_opponent = opponent_model
+
+        if phase != prev_phase:
+            print(f"\n>>> Curriculum phase: {phase} (at {timestep:,} steps)\n")
+            prev_phase = phase
 
         # Collect rollout
         buffers, obs_dict, episodes_done, episode_rewards = collect_rollout(
-            env, ppo, config, obs_dict, opponent_model=active_opponent
+            env, ppo, config, obs_dict,
+            opponent_model=active_opponent,
+            curriculum_fn=curriculum_fn,
         )
 
         # Count transitions collected
@@ -241,7 +314,7 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
         # PPO update
         active_buffers = [b for b in buffers.values() if b.size > 0]
         if active_buffers:
-            stats = ppo.update(active_buffers, progress=progress)
+            stats = ppo.update(active_buffers, progress=progress, entropy_coef=entropy_coef)
         else:
             stats = {"pg_loss": 0, "v_loss": 0, "entropy": 0}
 
@@ -252,6 +325,7 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
         writer.add_scalar("train/pg_loss", stats["pg_loss"], timestep)
         writer.add_scalar("train/v_loss", stats["v_loss"], timestep)
         writer.add_scalar("train/entropy", stats["entropy"], timestep)
+        writer.add_scalar("train/entropy_coef", entropy_coef, timestep)
         writer.add_scalar("train/fps", fps, timestep)
         writer.add_scalar("train/episodes", episodes_done, timestep)
 
@@ -269,7 +343,7 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
                 wins = sum(1 for r in episode_rewards if r > 0)
                 ep_info = f" | ep={episodes_done} wins={wins}/{len(episode_rewards)}"
             print(
-                f"[{timestep:>9d}/{config.total_timesteps}] "
+                f"[{timestep:>9d}/{config.total_timesteps}] ({phase}) "
                 f"pg={stats['pg_loss']:.4f} v={stats['v_loss']:.4f} "
                 f"ent={stats['entropy']:.4f} fps={fps:.0f}{ep_info}"
             )

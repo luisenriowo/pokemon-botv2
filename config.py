@@ -27,17 +27,23 @@ class Config:
 
     # PPO
     lr: float = 2.5e-4
-    gamma: float = 0.9999
+    gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.02
+    entropy_coef_end: float = 0.005
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     n_epochs: int = 4
-    n_minibatches: int = 4
+    n_minibatches: int = 8
 
     # Rollout
-    rollout_steps: int = 1024
+    rollout_steps: int = 2048
+
+    # Reward shaping
+    fainted_value: float = 0.15
+    hp_value: float = 0.08
+    victory_value: float = 1.0
 
     # Training
     total_timesteps: int = 10_000_000
@@ -45,7 +51,11 @@ class Config:
     save_freq: int = 50_000
     eval_battles: int = 100
 
-    # Self-play
+    # Curriculum: Phase 1 = vs MaxBasePower, Phase 2 = vs Heuristic, Phase 3 = self-play
+    curriculum_phase1_steps: int = 3_000_000
+    curriculum_phase2_steps: int = 8_000_000
+
+    # Self-play (Phase 3)
     opponent_update_freq: int = 200_000
     opponent_pool_size: int = 5
     use_opponent_pool: bool = False

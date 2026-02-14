@@ -562,9 +562,10 @@ class Gen9Env(SinglesEnv):
         return obs
 
     def calc_reward(self, battle: AbstractBattle) -> float:
-        """Sparse terminal reward: +1 win, -1 loss, 0 otherwise."""
-        if battle.won:
-            return 1.0
-        elif battle.lost:
-            return -1.0
-        return 0.0
+        """Dense delta reward: HP/fainted changes each turn + terminal win/loss."""
+        return self.reward_computing_helper(
+            battle,
+            fainted_value=self.config.fainted_value,
+            hp_value=self.config.hp_value,
+            victory_value=self.config.victory_value,
+        )
