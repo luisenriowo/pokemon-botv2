@@ -14,7 +14,7 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration, SimpleH
 from agent import PPOAgent
 from battle_player import TrainedRLPlayer
 from config import Config
-from environment import Gen9Env, OBS_SIZE
+from environment import Gen9Env, OBS_SIZE, SPECIES_VOCAB, MOVE_VOCAB, ABILITY_VOCAB, ITEM_VOCAB
 from model import ActorCritic
 from utils import compute_action_mask, save_checkpoint, load_checkpoint, setup_logging
 
@@ -157,8 +157,12 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
 
 def train(config: Config, resume_path: str = None, run_name: str = "A"):
     """Main self-play training loop."""
-    # Update obs_size from environment
+    # Update sizes from environment (authoritative source)
     config.obs_size = OBS_SIZE
+    config.species_vocab = SPECIES_VOCAB
+    config.move_vocab = MOVE_VOCAB
+    config.ability_vocab = ABILITY_VOCAB
+    config.item_vocab = ITEM_VOCAB
 
     # Separate dirs per run so parallel training doesn't collide
     model_dir = os.path.join(config.model_save_dir, run_name)

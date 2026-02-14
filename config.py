@@ -13,11 +13,11 @@ class Config:
     hidden_sizes: List[int] = field(default_factory=lambda: [512, 256])
     head_hidden: int = 256
 
-    # Embedding vocab sizes
-    species_vocab: int = 1500
-    move_vocab: int = 1000
-    ability_vocab: int = 400
-    item_vocab: int = 300
+    # Embedding vocab sizes (from GenData lookup tables; overridden at runtime)
+    species_vocab: int = 1550
+    move_vocab: int = 953
+    ability_vocab: int = 315
+    item_vocab: int = 584
 
     # Embedding dimensions
     species_embed_dim: int = 24

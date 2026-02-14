@@ -1,4 +1,6 @@
 import functools
+import re
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -13,6 +15,8 @@ from poke_env.battle.pokemon_type import PokemonType
 from poke_env.battle.side_condition import SideCondition
 from poke_env.battle.status import Status
 from poke_env.battle.weather import Weather
+from poke_env.data import GenData
+from poke_env.data.normalize import to_id_str
 from poke_env.environment.singles_env import SinglesEnv
 
 from config import Config
@@ -94,10 +98,38 @@ DIM_OPP_BENCH = 1 + 1 + 1 + N_TYPES + N_STATUS      # 27
 #   [25:30]  opp_bench species (5)
 N_CATEGORICAL = 30
 
-SPECIES_VOCAB = 1500
-MOVE_VOCAB = 1000
-ABILITY_VOCAB = 400
-ITEM_VOCAB = 300
+# ── Collision-free lookup tables (built from poke-env GenData) ────────────────
+
+_gen9 = GenData.from_gen(9)
+
+# Species: pokedex keys are already in to_id_str format
+_SPECIES_LIST = sorted(_gen9.pokedex.keys())
+SPECIES_TO_ID = {name: i + 1 for i, name in enumerate(_SPECIES_LIST)}
+SPECIES_VOCAB = len(_SPECIES_LIST) + 1  # 1550
+
+# Moves: move keys are already in to_id_str format
+_MOVES_LIST = sorted(_gen9.moves.keys())
+MOVE_TO_ID = {name: i + 1 for i, name in enumerate(_MOVES_LIST)}
+MOVE_VOCAB = len(_MOVES_LIST) + 1  # 953
+
+# Abilities: extract from pokedex, convert to to_id_str format
+_abilities = set()
+for _sd in _gen9.pokedex.values():
+    for _ab in _sd.get("abilities", {}).values():
+        _abilities.add(to_id_str(_ab))
+_ABILITIES_LIST = sorted(_abilities)
+ABILITY_TO_ID = {name: i + 1 for i, name in enumerate(_ABILITIES_LIST)}
+ABILITY_VOCAB = len(_ABILITIES_LIST) + 1  # 315
+
+# Items: parse from pokemon-showdown data (keys are already to_id_str format)
+_items_ts = Path(__file__).parent / "pokemon-showdown" / "data" / "items.ts"
+if _items_ts.exists():
+    _ITEMS_LIST = sorted(re.findall(r"^\t(\w+): \{", _items_ts.read_text(encoding="utf-8"), re.MULTILINE))
+    ITEM_TO_ID = {name: i + 1 for i, name in enumerate(_ITEMS_LIST)}
+    ITEM_VOCAB = len(_ITEMS_LIST) + 1  # 584
+else:
+    ITEM_TO_ID = None
+    ITEM_VOCAB = 600  # fallback
 
 N_CONTINUOUS = (
     DIM_WEATHER
@@ -118,14 +150,28 @@ OBS_SIZE = N_CONTINUOUS + N_CATEGORICAL  # = 682
 
 # ── Encoding helpers ──────────────────────────────────────────────────────────
 
-def _name_to_id(name: str, vocab_size: int) -> int:
-    """Deterministic hash (djb2) of a name to an index in [1, vocab_size). 0 = unknown/empty."""
+def _species_id(name: str) -> int:
+    """Lookup species index. Returns 0 for unknown/empty."""
+    return SPECIES_TO_ID.get(name, 0) if name else 0
+
+def _move_id(name: str) -> int:
+    """Lookup move index. Returns 0 for unknown/empty."""
+    return MOVE_TO_ID.get(name, 0) if name else 0
+
+def _ability_id(name: str) -> int:
+    """Lookup ability index. Returns 0 for unknown/empty."""
+    return ABILITY_TO_ID.get(name, 0) if name else 0
+
+def _item_id(name: str) -> int:
+    """Lookup item index. Falls back to hash if lookup table unavailable."""
     if not name:
         return 0
+    if ITEM_TO_ID is not None:
+        return ITEM_TO_ID.get(name, 0)
     h = 5381
     for c in name:
         h = ((h << 5) + h + ord(c)) & 0xFFFFFFFF
-    return (h % (vocab_size - 1)) + 1
+    return (h % (ITEM_VOCAB - 1)) + 1
 
 def _type_onehot(ptype: Optional[PokemonType]) -> np.ndarray:
     vec = np.zeros(N_TYPES, dtype=np.float32)
@@ -461,28 +507,28 @@ def embed_battle_standalone(battle: AbstractBattle) -> np.ndarray:
     cat = np.zeros(N_CATEGORICAL, dtype=np.float32)
     active = battle.active_pokemon
     if active:
-        cat[0] = _name_to_id(active.species, SPECIES_VOCAB)
+        cat[0] = _species_id(active.species)
         active_moves = list(active.moves.values())
         for i in range(min(4, len(active_moves))):
-            cat[1 + i] = _name_to_id(active_moves[i].id, MOVE_VOCAB)
+            cat[1 + i] = _move_id(active_moves[i].id)
         if active.ability:
-            cat[5] = _name_to_id(active.ability, ABILITY_VOCAB)
+            cat[5] = _ability_id(active.ability)
         if active.item:
-            cat[6] = _name_to_id(active.item, ITEM_VOCAB)
+            cat[6] = _item_id(active.item)
     for i, mon in enumerate(own_bench[:5]):
-        cat[7 + i] = _name_to_id(mon.species, SPECIES_VOCAB)
+        cat[7 + i] = _species_id(mon.species)
         if mon.ability:
-            cat[12 + i] = _name_to_id(mon.ability, ABILITY_VOCAB)
+            cat[12 + i] = _ability_id(mon.ability)
         if mon.item:
-            cat[17 + i] = _name_to_id(mon.item, ITEM_VOCAB)
+            cat[17 + i] = _item_id(mon.item)
     if opp_active:
-        cat[22] = _name_to_id(opp_active.species, SPECIES_VOCAB)
+        cat[22] = _species_id(opp_active.species)
         if opp_active.ability:
-            cat[23] = _name_to_id(opp_active.ability, ABILITY_VOCAB)
+            cat[23] = _ability_id(opp_active.ability)
         if opp_active.item:
-            cat[24] = _name_to_id(opp_active.item, ITEM_VOCAB)
+            cat[24] = _item_id(opp_active.item)
     for i, mon in enumerate(opp_bench[:5]):
-        cat[25 + i] = _name_to_id(mon.species, SPECIES_VOCAB)
+        cat[25 + i] = _species_id(mon.species)
     parts.append(cat)
 
     obs = np.concatenate(parts)
