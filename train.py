@@ -10,6 +10,8 @@ import numpy as np
 import torch
 
 from poke_env import AccountConfiguration, LocalhostServerConfiguration, SimpleHeuristicsPlayer
+from poke_env.battle.move_category import MoveCategory
+from poke_env.battle.pokemon_type import PokemonType
 
 from agent import PPOAgent
 from battle_player import TrainedRLPlayer
@@ -71,42 +73,183 @@ def make_env(config: Config, p1_name: str = "PPOPlayer1", p2_name: str = "PPOPla
 
 def _max_power_action(battle, mask):
     """MaxBasePowerPlayer logic: pick the highest base power legal move."""
+    # poke-env action space: 0-5=switch, 6-9=move, 10-13=mega, 14-17=zmove, 18-21=dmax, 22-25=tera
     best_action = -1
     best_power = -1
     for i, move in enumerate(battle.available_moves[:4]):
-        if mask[i] > 0 and move.base_power > best_power:
+        action_idx = 6 + i  # regular moves start at index 6
+        if action_idx < 26 and mask[action_idx] > 0 and move.base_power > best_power:
             best_power = move.base_power
-            best_action = i
+            best_action = action_idx
     if best_action >= 0:
         return best_action
     legal = np.where(mask > 0)[0]
     return int(np.random.choice(legal)) if len(legal) > 0 else 0
 
 
+def _stat_estimation(mon, stat: str) -> float:
+    """Estimate effective stat value accounting for boosts."""
+    base = mon.base_stats.get(stat, 100)
+    boost = mon.boosts.get(stat, 0)
+    if boost > 0:
+        return base * (2 + boost) / 2
+    elif boost < 0:
+        return base * 2 / (2 - boost)
+    return float(base)
+
+
+_SWITCH_OUT_MATCHUP_THRESHOLD = -2
+
+
+def _estimate_matchup(mon, opponent) -> float:
+    """Estimate type-based matchup score (positive = mon has advantage).
+
+    Replicates SimpleHeuristicsPlayer._estimate_matchup logic:
+    offensive - defensive + speed_bonus + hp_bonus
+    """
+    # Offensive: best effectiveness of our STAB types vs opponent
+    offensive = 1.0
+    for t in mon.types:
+        if t is not None and t != PokemonType.THREE_QUESTION_MARKS:
+            try:
+                eff = opponent.damage_multiplier(t)
+                offensive = max(offensive, eff)
+            except Exception:
+                pass
+
+    # Defensive: best effectiveness of opponent's STAB types vs us
+    defensive = 1.0
+    for t in opponent.types:
+        if t is not None and t != PokemonType.THREE_QUESTION_MARKS:
+            try:
+                eff = mon.damage_multiplier(t)
+                defensive = max(defensive, eff)
+            except Exception:
+                pass
+
+    # Speed tier bonus
+    speed_bonus = 0.1 if mon.base_stats.get("spe", 0) > opponent.base_stats.get("spe", 0) else -0.1
+
+    # HP advantage
+    hp_bonus = (mon.current_hp_fraction - opponent.current_hp_fraction) * 0.4
+
+    return offensive - defensive + speed_bonus + hp_bonus
+
+
+def _should_switch_out(battle) -> bool:
+    """Decide if we should switch out (mirrors SimpleHeuristicsPlayer logic)."""
+    active = battle.active_pokemon
+    opp = battle.opponent_active_pokemon
+    if not active or not opp or not battle.available_switches:
+        return False
+
+    # Check if any switch-in has a positive matchup
+    has_good_switch = any(
+        _estimate_matchup(m, opp) > 0 for m in battle.available_switches
+    )
+    if not has_good_switch:
+        return False
+
+    # Switch on severe stat drops
+    boosts = active.boosts
+    if boosts.get("def", 0) <= -3 or boosts.get("spd", 0) <= -3:
+        return True
+    if boosts.get("atk", 0) <= -3 and active.base_stats.get("atk", 0) >= active.base_stats.get("spa", 0):
+        return True
+    if boosts.get("spa", 0) <= -3 and active.base_stats.get("spa", 0) >= active.base_stats.get("atk", 0):
+        return True
+
+    # Switch on bad type matchup
+    if _estimate_matchup(active, opp) < _SWITCH_OUT_MATCHUP_THRESHOLD:
+        return True
+
+    return False
+
+
+def _switch_action_index(battle, switch_mon) -> int:
+    """Get the action index (0-5) for switching to a given Pokemon."""
+    team_list = list(battle.team.values())
+    for idx, mon in enumerate(team_list):
+        if mon.base_species == switch_mon.base_species:
+            return idx
+    return -1
+
+
 def _heuristic_action(battle, mask):
-    """Simplified heuristic: best damage move considering type effectiveness + STAB."""
-    best_action = -1
-    best_score = -1.0
+    """Heuristic opponent matching SimpleHeuristicsPlayer's key logic:
+    switching on bad matchups, stat-aware damage estimation, accuracy.
+
+    poke-env action space: 0-5=switch, 6-9=move, 10-13=mega, 14-17=zmove, 18-21=dmax, 22-25=tera
+    """
     active = battle.active_pokemon
     opp = battle.opponent_active_pokemon
 
+    if not active or not opp:
+        legal = np.where(mask > 0)[0]
+        return int(np.random.choice(legal)) if len(legal) > 0 else 0
+
+    # 1. Check if we should switch out
+    if _should_switch_out(battle):
+        best_switch_action = -1
+        best_switch_score = -float('inf')
+        for switch_mon in battle.available_switches:
+            action_idx = _switch_action_index(battle, switch_mon)
+            if action_idx < 0 or action_idx >= 6 or mask[action_idx] == 0:
+                continue
+            score = _estimate_matchup(switch_mon, opp)
+            if score > best_switch_score:
+                best_switch_score = score
+                best_switch_action = action_idx
+        if best_switch_action >= 0:
+            return best_switch_action
+
+    # 2. Score moves with stat-aware damage estimation
+    phys_ratio = _stat_estimation(active, "atk") / max(_stat_estimation(opp, "def"), 1)
+    spec_ratio = _stat_estimation(active, "spa") / max(_stat_estimation(opp, "spd"), 1)
+
+    best_action = -1
+    best_score = -1.0
+
     for i, move in enumerate(battle.available_moves[:4]):
-        if mask[i] == 0:
+        action_idx = 6 + i  # regular moves start at index 6
+        if action_idx >= 26 or mask[action_idx] == 0:
             continue
-        score = float(move.base_power)
-        if score > 0 and opp:
+
+        bp = float(move.base_power)
+        if bp == 0:
+            score = 30.0  # status moves get a small base score
+        else:
+            score = bp
+            # STAB
+            if move.type in active.types:
+                score *= 1.5
+            # Type effectiveness
             try:
                 score *= opp.damage_multiplier(move)
             except Exception:
                 pass
-            if active and move.type in active.types:
-                score *= 1.5
+            # Stat ratio
+            if move.category == MoveCategory.PHYSICAL:
+                score *= phys_ratio
+            elif move.category == MoveCategory.SPECIAL:
+                score *= spec_ratio
+            # Accuracy
+            acc = move.accuracy
+            if isinstance(acc, bool):
+                acc = 1.0
+            elif acc is not None and acc > 1.0:
+                acc = acc / 100.0
+            else:
+                acc = acc if acc else 1.0
+            score *= acc
+
         if score > best_score:
             best_score = score
-            best_action = i
+            best_action = action_idx
 
     if best_action >= 0:
         return best_action
+
     legal = np.where(mask > 0)[0]
     return int(np.random.choice(legal)) if len(legal) > 0 else 0
 
@@ -134,6 +277,7 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
     total_rewards = {name: 0.0 for name in agents_list}
     episodes_done = 0
     episode_rewards = []
+    episode_wins = 0
 
     for _ in range(config.rollout_steps):
         if not env.agents:
@@ -163,9 +307,8 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
         try:
             next_obs, rewards, terminated, truncated, infos = env.step(actions)
         except (AssertionError, Exception):
-            episodes_done += 1
+            # Don't count crashed episodes in win stats (outcome unknown)
             for ag in train_agents:
-                episode_rewards.append(total_rewards[ag])
                 total_rewards[ag] = 0.0
             obs_dict, _ = env.reset()
             continue
@@ -185,6 +328,10 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
 
         if all_done:
             episodes_done += 1
+            # Check actual battle outcome (more reliable than reward sign)
+            p1_battle = env.current_battles.get(p1)
+            if p1_battle is not None and p1_battle.won:
+                episode_wins += 1
             for ag in train_agents:
                 episode_rewards.append(total_rewards[ag])
                 total_rewards[ag] = 0.0
@@ -201,7 +348,7 @@ def collect_rollout(env, agent: PPOAgent, config: Config, obs_dict: dict,
             last_value = 0.0
         buffers[ag].compute_gae(last_value, config.gamma, config.gae_lambda)
 
-    return buffers, obs_dict, episodes_done, episode_rewards
+    return buffers, obs_dict, episodes_done, episode_rewards, episode_wins
 
 
 def train(config: Config, resume_path: str = None, run_name: str = "A"):
@@ -301,7 +448,7 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
             prev_phase = phase
 
         # Collect rollout
-        buffers, obs_dict, episodes_done, episode_rewards = collect_rollout(
+        buffers, obs_dict, episodes_done, episode_rewards, episode_wins = collect_rollout(
             env, ppo, config, obs_dict,
             opponent_model=active_opponent,
             curriculum_fn=curriculum_fn,
@@ -332,16 +479,14 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
         if episode_rewards:
             mean_reward = np.mean(episode_rewards)
             writer.add_scalar("train/mean_episode_reward", mean_reward, timestep)
-            win_count = sum(1 for r in episode_rewards if r > 0)
-            winrate = win_count / len(episode_rewards)
+            winrate = episode_wins / max(episodes_done, 1)
             writer.add_scalar("train/winrate", winrate, timestep)
 
         iteration += 1
         if iteration % 1 == 0:
             ep_info = ""
-            if episode_rewards:
-                wins = sum(1 for r in episode_rewards if r > 0)
-                ep_info = f" | ep={episodes_done} wins={wins}/{len(episode_rewards)}"
+            if episodes_done > 0:
+                ep_info = f" | ep={episodes_done} wins={episode_wins}/{episodes_done}"
             print(
                 f"[{timestep:>9d}/{config.total_timesteps}] ({phase}) "
                 f"pg={stats['pg_loss']:.4f} v={stats['v_loss']:.4f} "
