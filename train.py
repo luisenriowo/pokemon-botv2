@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import copy
+import csv
 import os
 import random
 import sys
@@ -368,6 +369,19 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
     device = ppo.device
     writer = setup_logging(log_dir)
 
+    # CSV logging for easy visualization
+    os.makedirs(log_dir, exist_ok=True)
+    csv_path = os.path.join(log_dir, "training_stats.csv")
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        "timestep", "phase", "pg_loss", "v_loss", "entropy", "entropy_coef",
+        "fps", "episodes", "wins", "winrate", "mean_reward",
+        "eval_winrate", "elapsed_hours",
+    ])
+    csv_file.flush()
+    train_start_time = time.time()
+
     start_timestep = 0
     if resume_path and os.path.exists(resume_path):
         start_timestep = load_checkpoint(resume_path, ppo.model, ppo.optimizer)
@@ -476,11 +490,24 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
         writer.add_scalar("train/fps", fps, timestep)
         writer.add_scalar("train/episodes", episodes_done, timestep)
 
+        mean_reward = np.mean(episode_rewards) if episode_rewards else 0.0
+        winrate = episode_wins / max(episodes_done, 1)
         if episode_rewards:
-            mean_reward = np.mean(episode_rewards)
             writer.add_scalar("train/mean_episode_reward", mean_reward, timestep)
-            winrate = episode_wins / max(episodes_done, 1)
             writer.add_scalar("train/winrate", winrate, timestep)
+
+        # CSV row (eval_winrate filled in later when evaluated)
+        elapsed_hours = (time.time() - train_start_time) / 3600
+        csv_writer.writerow([
+            timestep, phase,
+            f"{stats['pg_loss']:.6f}", f"{stats['v_loss']:.6f}",
+            f"{stats['entropy']:.6f}", f"{entropy_coef:.6f}",
+            f"{fps:.1f}", episodes_done, episode_wins,
+            f"{winrate:.4f}", f"{mean_reward:.4f}",
+            "",  # eval_winrate placeholder
+            f"{elapsed_hours:.4f}",
+        ])
+        csv_file.flush()
 
         iteration += 1
         if iteration % 1 == 0:
@@ -512,6 +539,15 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
                     )
                     writer.add_scalar("eval/vs_heuristic_winrate", winrate, timestep)
                     print(f"  [Eval] vs Heuristic: {winrate:.1%} ({config.eval_battles} battles)")
+                    # Also save eval row to CSV
+                    elapsed_hours = (time.time() - train_start_time) / 3600
+                    csv_writer.writerow([
+                        timestep, f"{phase}(eval)",
+                        "", "", "", "", "", "", "", "", "",
+                        f"{winrate:.4f}",
+                        f"{elapsed_hours:.4f}",
+                    ])
+                    csv_file.flush()
                     if winrate > best_winrate:
                         best_winrate = winrate
                         best_path = os.path.join(model_dir, "best.pt")
@@ -532,9 +568,11 @@ def train(config: Config, resume_path: str = None, run_name: str = "A"):
     final_path = os.path.join(model_dir, "final.pt")
     save_checkpoint(ppo.model, ppo.optimizer, timestep, final_path)
     print(f"\nTraining complete. Final model saved to {final_path}")
+    print(f"Training stats saved to {csv_path}")
 
     env.close()
     writer.close()
+    csv_file.close()
 
 
 def main():

@@ -11,12 +11,17 @@ from battle_player import TrainedRLPlayer
 from config import Config
 
 
-async def local_accept(model_path: str, config: Config, deterministic: bool):
+async def local_accept(model_path: str, config: Config, deterministic: bool,
+                      use_mcts: bool = False, mcts_mode: str = 'improved',
+                      mcts_rollouts: int = 200):
     """Accept challenges on local Showdown server."""
     player = TrainedRLPlayer(
         model_path=model_path,
         config=config,
         deterministic=deterministic,
+        use_mcts=use_mcts,
+        mcts_mode=mcts_mode,
+        mcts_rollouts=mcts_rollouts,
         account_configuration=AccountConfiguration("AntiMateo", None),
         battle_format=config.battle_format,
         server_configuration=LocalhostServerConfiguration,
@@ -25,6 +30,8 @@ async def local_accept(model_path: str, config: Config, deterministic: bool):
     print(f"Waiting for challenges on local server as 'AntiMateo'...")
     print(f"Format: {config.battle_format}")
     print(f"Mode: {'deterministic' if deterministic else 'stochastic'}")
+    if use_mcts:
+        print(f"MCTS: {mcts_mode} mode with {mcts_rollouts} rollouts")
     print("Press Ctrl+C to stop.\n")
 
     try:
@@ -35,18 +42,25 @@ async def local_accept(model_path: str, config: Config, deterministic: bool):
         print("\nStopped.")
 
 
-async def local_challenge(model_path: str, opponent: str, config: Config, deterministic: bool, n_games: int):
+async def local_challenge(model_path: str, opponent: str, config: Config, deterministic: bool, n_games: int,
+                         use_mcts: bool = False, mcts_mode: str = 'improved',
+                         mcts_rollouts: int = 200):
     """Challenge a specific user on local server."""
     player = TrainedRLPlayer(
         model_path=model_path,
         config=config,
         deterministic=deterministic,
+        use_mcts=use_mcts,
+        mcts_mode=mcts_mode,
+        mcts_rollouts=mcts_rollouts,
         account_configuration=AccountConfiguration("AntiMateo", None),
         battle_format=config.battle_format,
         server_configuration=LocalhostServerConfiguration,
     )
 
     print(f"Challenging '{opponent}' on local server...")
+    if use_mcts:
+        print(f"Using MCTS: {mcts_mode} mode with {mcts_rollouts} rollouts")
     for i in range(n_games):
         await player.send_challenges(opponent, 1)
         print(f"  Game {i+1}/{n_games}: W/L/T = {player.n_won_battles}/{player.n_lost_battles}/{player.n_tied_battles}")
@@ -54,12 +68,17 @@ async def local_challenge(model_path: str, opponent: str, config: Config, determ
     print(f"\nFinal: {player.n_won_battles}W / {player.n_lost_battles}L / {player.n_tied_battles}T")
 
 
-async def online_ladder(model_path: str, username: str, password: str, config: Config, deterministic: bool, n_games: int):
+async def online_ladder(model_path: str, username: str, password: str, config: Config, deterministic: bool, n_games: int,
+                       use_mcts: bool = False, mcts_mode: str = 'improved',
+                       mcts_rollouts: int = 200):
     """Play on the official Showdown ladder."""
     player = TrainedRLPlayer(
         model_path=model_path,
         config=config,
         deterministic=deterministic,
+        use_mcts=use_mcts,
+        mcts_mode=mcts_mode,
+        mcts_rollouts=mcts_rollouts,
         account_configuration=AccountConfiguration(username, password),
         battle_format=config.battle_format,
         server_configuration=ShowdownServerConfiguration,
@@ -68,6 +87,8 @@ async def online_ladder(model_path: str, username: str, password: str, config: C
     print(f"Playing ladder on Showdown as '{username}'...")
     print(f"Format: {config.battle_format}")
     print(f"Games: {n_games}")
+    if use_mcts:
+        print(f"MCTS: {mcts_mode} mode with {mcts_rollouts} rollouts")
     print()
 
     await player.ladder(n_games)
@@ -75,18 +96,25 @@ async def online_ladder(model_path: str, username: str, password: str, config: C
     print(f"\nLadder results: {player.n_won_battles}W / {player.n_lost_battles}L / {player.n_tied_battles}T")
 
 
-async def online_challenge(model_path: str, opponent: str, username: str, password: str, config: Config, deterministic: bool, n_games: int):
+async def online_challenge(model_path: str, opponent: str, username: str, password: str, config: Config, deterministic: bool, n_games: int,
+                          use_mcts: bool = False, mcts_mode: str = 'improved',
+                          mcts_rollouts: int = 200):
     """Challenge a specific user on official Showdown."""
     player = TrainedRLPlayer(
         model_path=model_path,
         config=config,
         deterministic=deterministic,
+        use_mcts=use_mcts,
+        mcts_mode=mcts_mode,
+        mcts_rollouts=mcts_rollouts,
         account_configuration=AccountConfiguration(username, password),
         battle_format=config.battle_format,
         server_configuration=ShowdownServerConfiguration,
     )
 
     print(f"Challenging '{opponent}' on Showdown as '{username}'...")
+    if use_mcts:
+        print(f"Using MCTS: {mcts_mode} mode with {mcts_rollouts} rollouts")
     for i in range(n_games):
         await player.send_challenges(opponent, 1)
         print(f"  Game {i+1}/{n_games}: W/L/T = {player.n_won_battles}/{player.n_lost_battles}/{player.n_tied_battles}")
@@ -105,12 +133,20 @@ def main():
     accept = local_sub.add_parser("accept", help="Accept incoming challenges")
     accept.add_argument("--model", type=str, required=True)
     accept.add_argument("--stochastic", action="store_true")
+    accept.add_argument("--mcts", action="store_true", help="Use MCTS")
+    accept.add_argument("--mcts-mode", type=str, default="improved",
+                       choices=["simple", "improved"], help="MCTS mode")
+    accept.add_argument("--rollouts", type=int, default=200, help="MCTS rollouts")
 
     challenge = local_sub.add_parser("challenge", help="Challenge a specific user")
     challenge.add_argument("opponent", type=str)
     challenge.add_argument("--model", type=str, required=True)
     challenge.add_argument("--games", type=int, default=1)
     challenge.add_argument("--stochastic", action="store_true")
+    challenge.add_argument("--mcts", action="store_true", help="Use MCTS")
+    challenge.add_argument("--mcts-mode", type=str, default="improved",
+                          choices=["simple", "improved"], help="MCTS mode")
+    challenge.add_argument("--rollouts", type=int, default=200, help="MCTS rollouts")
 
     # Online subcommand
     online = subparsers.add_parser("online", help="Play on official Showdown")
@@ -122,6 +158,10 @@ def main():
     ladder.add_argument("--password", type=str, required=True)
     ladder.add_argument("--games", type=int, default=50)
     ladder.add_argument("--stochastic", action="store_true")
+    ladder.add_argument("--mcts", action="store_true", help="Use MCTS")
+    ladder.add_argument("--mcts-mode", type=str, default="improved",
+                       choices=["simple", "improved"], help="MCTS mode")
+    ladder.add_argument("--rollouts", type=int, default=200, help="MCTS rollouts")
 
     online_chal = online_sub.add_parser("challenge", help="Challenge a specific user")
     online_chal.add_argument("opponent", type=str)
@@ -130,21 +170,31 @@ def main():
     online_chal.add_argument("--password", type=str, required=True)
     online_chal.add_argument("--games", type=int, default=1)
     online_chal.add_argument("--stochastic", action="store_true")
+    online_chal.add_argument("--mcts", action="store_true", help="Use MCTS")
+    online_chal.add_argument("--mcts-mode", type=str, default="improved",
+                            choices=["simple", "improved"], help="MCTS mode")
+    online_chal.add_argument("--rollouts", type=int, default=200, help="MCTS rollouts")
 
     args = parser.parse_args()
     config = Config()
     det = not getattr(args, "stochastic", False)
+    use_mcts = getattr(args, "mcts", False)
+    mcts_mode = getattr(args, "mcts_mode", "improved")
+    mcts_rollouts = getattr(args, "rollouts", 200)
 
     if args.mode == "local":
         if args.action == "accept":
-            asyncio.run(local_accept(args.model, config, det))
+            asyncio.run(local_accept(args.model, config, det, use_mcts, mcts_mode, mcts_rollouts))
         elif args.action == "challenge":
-            asyncio.run(local_challenge(args.model, args.opponent, config, det, args.games))
+            asyncio.run(local_challenge(args.model, args.opponent, config, det, args.games,
+                                       use_mcts, mcts_mode, mcts_rollouts))
     elif args.mode == "online":
         if args.action == "ladder":
-            asyncio.run(online_ladder(args.model, args.username, args.password, config, det, args.games))
+            asyncio.run(online_ladder(args.model, args.username, args.password, config, det, args.games,
+                                     use_mcts, mcts_mode, mcts_rollouts))
         elif args.action == "challenge":
-            asyncio.run(online_challenge(args.model, args.opponent, args.username, args.password, config, det, args.games))
+            asyncio.run(online_challenge(args.model, args.opponent, args.username, args.password, config, det, args.games,
+                                        use_mcts, mcts_mode, mcts_rollouts))
 
 
 if __name__ == "__main__":

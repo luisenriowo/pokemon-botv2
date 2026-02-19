@@ -3,3 +3,4 @@ pokemon-showdown/
 models/
 .claude/
 logs/
+*.md

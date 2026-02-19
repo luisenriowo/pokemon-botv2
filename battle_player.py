@@ -8,6 +8,9 @@ from config import Config
 from environment import OBS_SIZE, embed_battle_standalone
 from model import ActorCritic
 from utils import compute_action_mask, load_checkpoint
+from mcts import mcts_action
+from mcts_simple import simple_mcts_action
+from mcts_improved import improved_mcts_action
 
 
 class TrainedRLPlayer(Player):
@@ -18,11 +21,28 @@ class TrainedRLPlayer(Player):
         model_path: str,
         config: Config = None,
         deterministic: bool = True,
+        use_mcts: bool = False,
+        mcts_mode: str = 'improved',  # 'simple', 'improved', or 'full' (Node.js)
+        mcts_rollouts: int = 200,
+        mcts_verbose: bool = False,
+        # Improvement flags (only for 'improved' mode)
+        mcts_smart_opponent: bool = True,
+        mcts_value_bootstrap: bool = True,
+        mcts_move_ordering: bool = True,
+        mcts_adaptive_rollouts: bool = False,  # Ablation study showed this hurts performance
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.config = config or Config()
         self.deterministic = deterministic
+        self.use_mcts = use_mcts
+        self.mcts_mode = mcts_mode
+        self.mcts_rollouts = mcts_rollouts
+        self.mcts_verbose = mcts_verbose
+        self.mcts_smart_opponent = mcts_smart_opponent
+        self.mcts_value_bootstrap = mcts_value_bootstrap
+        self.mcts_move_ordering = mcts_move_ordering
+        self.mcts_adaptive_rollouts = mcts_adaptive_rollouts
 
         self.model = ActorCritic(
             obs_dim=OBS_SIZE,
@@ -50,9 +70,48 @@ class TrainedRLPlayer(Player):
 
         with torch.no_grad():
             dist, value = self.model(obs_t, mask_t)
-            if self.deterministic:
-                action = dist.probs.argmax(dim=-1).item()
+
+            if self.use_mcts:
+                # Use MCTS with NN priors and value
+                priors = dist.probs.squeeze(0).numpy()
+                value_estimate = value.item()
+
+                if self.mcts_mode == 'simple':
+                    # Simplified Python-only MCTS (baseline)
+                    action = simple_mcts_action(
+                        battle,
+                        priors,
+                        value_estimate,
+                        mask,
+                        n_rollouts=self.mcts_rollouts,
+                    )
+                elif self.mcts_mode == 'improved':
+                    # Improved Python MCTS with enhancements
+                    action = improved_mcts_action(
+                        battle,
+                        priors,
+                        value_estimate,
+                        mask,
+                        n_rollouts=self.mcts_rollouts,
+                        use_smart_opponent=self.mcts_smart_opponent,
+                        use_value_bootstrap=self.mcts_value_bootstrap,
+                        use_move_ordering=self.mcts_move_ordering,
+                        use_adaptive_rollouts=self.mcts_adaptive_rollouts,
+                    )
+                else:
+                    # Full MCTS with Node.js Showdown simulator
+                    action = mcts_action(
+                        battle,
+                        priors,
+                        value_estimate,
+                        mask,
+                        verbose=self.mcts_verbose,
+                    )
             else:
-                action = dist.sample().item()
+                # Direct policy sampling
+                if self.deterministic:
+                    action = dist.probs.argmax(dim=-1).item()
+                else:
+                    action = dist.sample().item()
 
         return SinglesEnv.action_to_order(np.int64(action), battle, strict=False)

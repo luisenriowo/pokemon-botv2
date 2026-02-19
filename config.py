@@ -52,8 +52,8 @@ class Config:
     eval_battles: int = 100
 
     # Curriculum: Phase 1 = vs MaxBasePower, Phase 2 = vs Heuristic, Phase 3 = self-play
-    curriculum_phase1_steps: int = 4_000_000
-    curriculum_phase2_steps: int = 10_000_000
+    curriculum_phase1_steps: int = 5_000_000
+    curriculum_phase2_steps: int = 12_000_000
 
     # Self-play (Phase 3)
     opponent_update_freq: int = 200_000
